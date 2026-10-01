@@ -296,7 +296,15 @@ impl Render for Root {
                 div()
                     .absolute()
                     .inset_0()
-                    .children(self.plugins.iter().map(|plugin| plugin.view.clone())),
+                    // Cached, so a frame the application's view asked for
+                    // replays the overlays (an open sheet) instead of
+                    // rebuilding them. An overlay that changes must notify.
+                    .children(self.plugins.iter().map(|plugin| {
+                        plugin
+                            .view
+                            .clone()
+                            .cached(StyleRefinement::default().absolute().inset_0())
+                    })),
             );
         for plugin in &self.plugins {
             (plugin.style)(&mut content, window, cx);
@@ -312,7 +320,7 @@ impl Render for Root {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{StatefulInteractiveElement as _, TestAppContext};
 
     struct Content;
     impl Render for Content {
@@ -329,6 +337,99 @@ mod tests {
     impl RootPlugin for Layer {}
     fn layer(_: &mut Window, _: &mut Context<Layer>) -> Layer {
         Layer
+    }
+
+    /// Application content that moves: each frame it asks for the next one,
+    /// as an animated view does, so every frame notifies it and so the root.
+    struct Moving;
+    impl Render for Moving {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            window.request_animation_frame();
+            div()
+        }
+    }
+
+    /// An overlay that counts how often it is built, shows a number, and
+    /// counts the clicks that land on its button.
+    struct Counting {
+        builds: usize,
+        shown: usize,
+        clicks: usize,
+    }
+    impl Render for Counting {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.builds += 1;
+            let shown = self.shown;
+            div().size_full().child(
+                div()
+                    .id("button")
+                    .debug_selector(move || format!("shown-{shown}"))
+                    .size_8()
+                    .on_click(cx.listener(|this, _, _, _| this.clicks += 1)),
+            )
+        }
+    }
+    impl RootPlugin for Counting {}
+
+    /// A window whose content is moving, with a `Counting` overlay open over it.
+    fn moving_with_overlay(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Counting>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            Root::register_plugin(cx, |_, _| Counting {
+                builds: 0,
+                shown: 0,
+                clicks: 0,
+            });
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| Moving);
+            Root::new(content, window, cx)
+        });
+        let overlay = root.read_with(cx, |root, _| root.plugin::<Counting>().unwrap());
+        // Tests have no frame loop: this delivers the frame the content asked for.
+        pass(cx);
+        (overlay, cx)
+    }
+
+    /// Lets one frame of the content's motion pass and draws it.
+    fn pass(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn motion_behind_an_overlay_leaves_the_overlay_as_drawn(cx: &mut TestAppContext) {
+        let (overlay, cx) = moving_with_overlay(cx);
+        let before = overlay.read_with(cx, |overlay, _| overlay.builds);
+        for _ in 0..10 {
+            pass(cx);
+        }
+        assert_eq!(overlay.read_with(cx, |overlay, _| overlay.builds), before);
+    }
+
+    #[gpui::test]
+    fn an_overlay_that_notifies_shows_its_new_state_over_motion(cx: &mut TestAppContext) {
+        let (overlay, cx) = moving_with_overlay(cx);
+        assert!(cx.debug_bounds("shown-0").is_some());
+        overlay.update(cx, |overlay, cx| {
+            overlay.shown = 1;
+            cx.notify();
+        });
+        pass(cx);
+        assert!(cx.debug_bounds("shown-1").is_some());
+        assert!(cx.debug_bounds("shown-0").is_none());
+    }
+
+    #[gpui::test]
+    fn a_click_in_an_overlay_over_motion_reaches_it(cx: &mut TestAppContext) {
+        let (overlay, cx) = moving_with_overlay(cx);
+        pass(cx);
+        let at = cx.debug_bounds("shown-0").unwrap().center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        pass(cx);
+        assert_eq!(overlay.read_with(cx, |overlay, _| overlay.clicks), 1);
     }
 
     #[gpui::test]
