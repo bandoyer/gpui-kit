@@ -5,6 +5,11 @@ use gpui::{
 };
 use instant::Duration;
 
+/// How many poses a second the spinner turns at. Uncapped, it asks for every
+/// frame the display offers (240 a second on a 240 Hz display) for a turn
+/// that 30 poses a second draws smoothly, 24 to a turn.
+const POSES_PER_SECOND: f32 = 30.;
+
 /// A cycling loading spinner.
 #[derive(IntoElement)]
 pub struct Spinner {
@@ -66,7 +71,10 @@ impl RenderOnce for Spinner {
                     .when_some(self.color, |this, color| this.text_color(color))
                     .with_animation(
                         "circle",
-                        Animation::new(self.speed).repeat().with_easing(self.easing),
+                        Animation::new(self.speed)
+                            .repeat()
+                            .with_easing(self.easing)
+                            .with_max_fps(POSES_PER_SECOND),
                         |this, delta| this.transform(Transformation::rotate(percentage(delta))),
                     ),
             )
@@ -78,26 +86,62 @@ impl RenderOnce for Spinner {
 mod tests {
     use super::*;
     use gpui::{Render, TestAppContext, px, size};
+    use std::{cell::Cell, rc::Rc};
 
-    struct SpinnerHost;
+    struct SpinnerHost {
+        renders: Rc<Cell<usize>>,
+    }
 
     impl Render for SpinnerHost {
         fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
             Spinner::new()
         }
+    }
+
+    fn open_host(cx: &mut TestAppContext) -> (Rc<Cell<usize>>, gpui::WindowHandle<SpinnerHost>) {
+        let renders = Rc::new(Cell::new(0));
+        let host = renders.clone();
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| SpinnerHost {
+            renders: host,
+        });
+        cx.run_until_parked();
+        (renders, window)
     }
 
     #[gpui::test]
     fn reduced_motion_spinner_is_static_and_requests_no_frame(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
-        let window = cx.open_window(size(px(100.), px(100.)), |_, _| SpinnerHost);
-        cx.run_until_parked();
+        let (_, window) = open_host(cx);
 
         assert_eq!(
             window
                 .update(cx, |_, window, cx| window.simulate_next_frame(cx))
                 .unwrap(),
             0
+        );
+    }
+
+    /// A 240 Hz display offers a frame every 4.17 ms. The spinner takes a
+    /// pose in 30 of the 240 each second, on its own timer, and asks for no
+    /// frame of its own.
+    #[gpui::test]
+    fn spinner_turns_at_thirty_poses_a_second_on_a_240_hz_display(cx: &mut TestAppContext) {
+        let (renders, window) = open_host(cx);
+        let before = renders.get();
+
+        for _ in 0..240 {
+            cx.executor().advance_clock(Duration::from_nanos(4_166_667));
+            window
+                .update(cx, |_, window, cx| window.simulate_next_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+
+        let poses = renders.get() - before;
+        assert!(
+            (29..=31).contains(&poses),
+            "a second of a 240 Hz display drew {poses} poses"
         );
     }
 }
